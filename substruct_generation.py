@@ -13,8 +13,24 @@ H_TOKEN = "[#1]"
 L0_SMARTS = "[a:1]1:a:a:a:a:1"
 
 SUBSTITUENT_CATALOG = {
-    "C1": "[CH3,CH2]", "C2": "[CH,CH0]", "C3": "[c]", "N1": "[NH2,NH,N+]",
-    "N2": "[N+0H0]", "N3": "[n+0]", "O1": "[O]", "S1": "[S]", "F": "[F]", "Cl": "[Cl]"
+    "C1": ('!=!@', '[CH3,CH2]'),  
+    "C2": ('!=!@', '[CH,CH0]'),   
+    "C3": ('!=!:', '[c]'),        
+    "C4": ('!=@',  '[C]'),        
+    "C5": (':',    '[c]'),        
+    "N1": ('!=!@', '[NH2,NH,N+]'),
+    "N2": ('!=!@', '[N+0H0]'),    
+    "N3": ('!=!:', '[n+0]'),      
+    "N4": (':',    '[n+0]'),      
+    "N5": ('!=@',  '[N+0]'),      
+    "O1": ('!=!@', '[O]'),        
+    "O2": ('!=@',  '[O]'),        
+    "O3": (':',    '[o]'),        
+    "S1": ('!=!@', '[S]'),        
+    "S2": ('!=@',  '[S]'),        
+    "S3": (':',    '[s]'),        
+    "F":  ('-',    '[F]'),        
+    "Cl": ('-',    '[Cl]')        
 }
 APPLICABLE_SUBSTITUENTS = list(SUBSTITUENT_CATALOG.keys())
 
@@ -24,9 +40,6 @@ def canonical_reflect_tuple(seq):
     return min(tuple(seq), tuple(reversed(seq)))
 
 def canonical_necklace(seq):
-    """
-    Канонизация с поворотами
-    """
     n = len(seq)
     reps = {tuple(seq), tuple(reversed(seq))}
     fwd = list(seq)
@@ -39,9 +52,6 @@ def canonical_necklace(seq):
     return min(reps)
 
 def build_smarts(pattern, level):
-    """
-    Сборка SMARTS
-    """
     if level == 1: return L0_SMARTS
 
     def add_ring_label(atom_str):
@@ -56,7 +66,9 @@ def build_smarts(pattern, level):
         if tag == "H":
             current_part = atom.replace("(*)", f"({H_TOKEN})")
         elif tag and tag != "*":
-            current_part = atom.replace("(*)", f"({SUBSTITUENT_CATALOG[tag]})")
+            bond, atom_part = SUBSTITUENT_CATALOG[tag]
+            substituent_smarts = f"({bond}{atom_part})"
+            current_part = atom.replace("(*)", substituent_smarts)
         
         if i == 0:
             if level == 2:
