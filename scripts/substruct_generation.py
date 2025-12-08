@@ -4,14 +4,6 @@ from tqdm import tqdm
 
 
 # заместители и ключевые элементы (таблицы 3, 4)
-C_STAR = "[#6](*)"
-N_NOSTAR = "[#7+0]"
-N_STAR = "[#7+0](*)"
-O_ATOM = "[#8]"
-S_ATOM = "[#16]"
-H_TOKEN = "[#1]"
-L0_SMARTS = "[a:1]:1:a:a:a:a1"
-
 SUBSTITUENT_CATALOG = {
     "C1": ('!=!@', '[CH3,CH2]'),  
     "C2": ('!=!@', '[CH,CH0]'),   
@@ -32,113 +24,208 @@ SUBSTITUENT_CATALOG = {
     "F":  ('-',    '[F]'),        
     "Cl": ('-',    '[Cl]')        
 }
-APPLICABLE_SUBSTITUENTS = list(SUBSTITUENT_CATALOG.keys())
+
+ATOM_CONFIG = {
+    "C_STAR":   {"smarts": "[#6]",   "has_sub": True},  
+    "N_NOSTAR": {"smarts": "[#7+0]", "has_sub": False}, 
+    "N_STAR":   {"smarts": "[#7+0]", "has_sub": True},  
+    "O_ATOM":   {"smarts": "[#8]",   "has_sub": False}, 
+    "S_ATOM":   {"smarts": "[#16]",  "has_sub": False}, 
+}
+
+BACKBONE_POOL = ["C_STAR", "N_NOSTAR"]  
+CENTER_POOL   = ["N_STAR", "O_ATOM", "S_ATOM"] 
+H_TOKEN = "[#1]"
 
 
-#  вспомогательные функции
-def canonical_reflect_tuple(seq):
-    return min(tuple(seq), tuple(reversed(seq)))
+class HeterocycleGenerator:
+    def __init__(self, ring_size=5, min_subs=2, max_subs=3, max_n_skeleton=2, substituents=None):
+        self.ring_size = ring_size
+        self.backbone_len = ring_size - 1
+        self.min_subs = min_subs
+        self.max_subs = max_subs
+        self.max_n_skeleton = max_n_skeleton
+        self.substituents = substituents if substituents else list(SUBSTITUENT_CATALOG.keys())
 
-def canonical_necklace(seq):
-    n = len(seq)
-    reps = {tuple(seq), tuple(reversed(seq))}
-    fwd = list(seq)
-    rev = list(reversed(seq))
-    for _ in range(n - 1):
-        fwd = fwd[1:] + fwd[:1]
-        rev = rev[1:] + rev[:1]
-        reps.add(tuple(fwd))
-        reps.add(tuple(rev))
-    return min(reps)
+    # вспомогательные функции
+    @staticmethod
+    def _canonical_necklace(seq):
+        n = len(seq)
+        reps = set()
+        fwd = list(seq)
+        rev = list(reversed(seq))
+        for _ in range(n):
+            reps.add(tuple(fwd))
+            reps.add(tuple(rev))
+            fwd = fwd[1:] + fwd[:1]
+            rev = rev[1:] + rev[:1]
+        return min(reps)
 
-def build_smarts(pattern, level):
-    if level == 1: return L0_SMARTS
+    def _align_to_center(self, sequence):
+        # сдвиг цикла так, чтобы первым атомом был центр (S, O, N*)
+        center_idx = -1
+        for i, (atom, _) in enumerate(sequence):
+            if atom in CENTER_POOL:
+                center_idx = i
+                break
+        return list(sequence) if center_idx == -1 else sequence[center_idx:] + sequence[:center_idx]
 
-    def add_ring_label(atom_str):
-        if ":1" in atom_str: return atom_str
-        return atom_str.replace("]", ":1]", 1) if "]" in atom_str else f"[{atom_str}:1]"
+    def _build_smarts(self, sequence, level):
+        if level == 0:
+            # L0: базовый SMARTS
+            return f"[a:1]:1{':a' * (self.ring_size - 1)}:1"
 
-    parts = []
-    for i, p_str in enumerate(pattern):
-        atom, tag = (p_str.split('|', 1) + [''])[:2]
-        
-        current_part = atom
-        if tag == "H":
-            current_part = atom.replace("(*)", f"({H_TOKEN})")
-        elif tag and tag != "*":
-            bond, atom_part = SUBSTITUENT_CATALOG[tag]
-            substituent_smarts = f"({bond}{atom_part})"
-            current_part = atom.replace("(*)", substituent_smarts)
-        
-        if i == 0:
-            if level == 2:
-                current_part = "[a:1]"
-            else:
-                current_part = add_ring_label(current_part)
-
-        parts.append(current_part)
-
-    return parts[0] + "1:" + ":".join(parts[1:]) + ":1"
-
-#  основной генератор
-def generate_hierarchical_library():
-
-    # L1: скелеты
-    choices = [C_STAR, N_NOSTAR]
-    layer1_skeletons = list({canonical_reflect_tuple(s): s for s in product(choices, repeat=4) if s.count(N_NOSTAR) <= 2}.values())
-
-    # L2: ядра
-    centers = [C_STAR, N_STAR, O_ATOM, S_ATOM]
-    layer2_cores_h = [((skel, (center,) + skel)) for skel in layer1_skeletons for center in centers]
-
-    # L3: маски
-    layer3_masks_h = []
-    for skel, core in tqdm(layer2_cores_h, desc="Generating L3 (Masks)"):
-        free_pos = [i for i, token in enumerate(core) if "(*)" in token]
-        for k in (2, 3):
-            if len(free_pos) < k: continue
-            for indices in combinations(free_pos, k):
-                mask = tuple(f"{atom}|*" if i in indices else f"{atom}|H" if "(*)" in atom else f"{atom}|" for i, atom in enumerate(core))
-                layer3_masks_h.append((skel, core, mask))
-    
-    unique_masks = {canonical_necklace(m): (s, c, m) for s, c, m in layer3_masks_h}
-    
-    # L4: добавление заместителей
-    final_hierarchy = []
-    for skel, core, mask in tqdm(unique_masks.values(), desc="Generating L4 (Substituents)"):
-        star_pos = [i for i, p in enumerate(mask) if p.endswith("|*")]
-        for labels in product(APPLICABLE_SUBSTITUENTS, repeat=len(star_pos)):
-            final_pat = list(mask)
-            for i, pos in enumerate(star_pos):
-                final_pat[pos] = f"{mask[pos].split('|')[0]}|{labels[i]}"
-            final_hierarchy.append((skel, core, mask, tuple(final_pat)))
-
-    # сборка таблицы
-    final_data = {}
-    parent_smarts_cache = {}
-    
-    for skeleton_pat, core_pat, mask_pat, final_pat in tqdm(final_hierarchy, desc="Building DataFrame"):
-        canon_final_pat = canonical_necklace(final_pat)
-        if canon_final_pat not in final_data:
-            key_cache = (skeleton_pat, core_pat, mask_pat)
-            if key_cache not in parent_smarts_cache:
-                parent_smarts_cache[key_cache] = {
-                    "layer1_smarts": build_smarts(None, level=1),
-                    "layer2_smarts": build_smarts(('a',) + skeleton_pat, level=2),
-                    "layer3_smarts": build_smarts(core_pat, level=3),
-                    "layer4_smarts": build_smarts(mask_pat, level=4),
-                }
+        parts = []
+        for i, (atom_key, sub_tag) in enumerate(sequence):
+            config = ATOM_CONFIG.get(atom_key, {"smarts": atom_key, "has_sub": True})
+            base_smarts = config['smarts']
+            has_sub = config['has_sub']
             
-            final_data[canon_final_pat] = {
-                **parent_smarts_cache[key_cache],
-                "layer5_smarts": build_smarts(final_pat, level=5)
-            }
+            current_part = base_smarts
 
-    df = pd.DataFrame.from_dict(final_data, orient='index')
-    return df.sort_values(by=list(df.columns)).reset_index(drop=True)
+            # L1: скелеты 
+            if level == 1:
+                if i == 0:
+                    current_part = "[a:1]"
+                else:
+                    current_part = f"{base_smarts}(*)" if has_sub else base_smarts
+            
+            # L2: ядра
+            elif level == 2:
+                current_part = f"{base_smarts}(*)" if has_sub else base_smarts
+            
+            # L3 (маски) и L4 (финальные)
+            else:
+                if sub_tag == '*':
+                    current_part = f"{base_smarts}(*)"
+                elif sub_tag == 'H' and has_sub:
+                    current_part = f"{base_smarts}({H_TOKEN})"
+                elif sub_tag in SUBSTITUENT_CATALOG:
+                    bond, group = SUBSTITUENT_CATALOG[sub_tag]
+                    current_part = f"{base_smarts}({bond}{group})"
+            
+            # Добавление метки [atom:1] к первому атому, если её нет
+            if i == 0 and ":1" not in current_part:
+                # Вставка метки перед закрывающей скобкой или в конец
+                if "]" in current_part:
+                    current_part = current_part.replace("]", ":1]", 1)
+                else:
+                    current_part = f"[{current_part}:1]"
+            
+            parts.append(current_part)
+
+        # Сборка: [Start]:1 : [Next] : ... :1
+        return parts[0] + ":1:" + ":".join(parts[1:]) + ":1"
+
+    # основной генератор
+    def generate_library(self):
+        
+        # L1: скелеты
+        valid_backbones = []
+        for skel in product(BACKBONE_POOL, repeat=self.backbone_len):
+            if skel.count("N_NOSTAR") <= self.max_n_skeleton:
+                valid_backbones.append(skel)
+        
+        # L2: ядра
+        unique_cores = []
+        seen_cores = set()
+        for center in CENTER_POOL:
+            for backbone in valid_backbones:
+                raw_core = (center,) + backbone
+                canon_core = self._canonical_necklace(raw_core)
+                if canon_core not in seen_cores:
+                    seen_cores.add(canon_core)
+                    unique_cores.append(canon_core)
+
+        # L3: маски
+        unique_masks = []
+        seen_masks_reps = set()
+        
+        for core in tqdm(unique_cores, desc="Generating L3 (Masks)"):
+            free_pos = [i for i, atom in enumerate(core) if ATOM_CONFIG[atom]['has_sub']]
+            for k in range(self.min_subs, self.max_subs + 1):
+                if len(free_pos) < k: continue
+                for indices in combinations(free_pos, k):
+                    mask_struct = []
+                    for i, atom in enumerate(core):
+                        tag = '*' if i in indices else ('H' if ATOM_CONFIG[atom]['has_sub'] else None)
+                        mask_struct.append((atom, tag))
+                    
+                    canon_mask = self._canonical_necklace(tuple(mask_struct))
+                    if canon_mask not in seen_masks_reps:
+                        seen_masks_reps.add(canon_mask)
+                        unique_masks.append(canon_mask)
+
+        # L4: добавление заместителей
+        final_data = []
+        seen_final_structs = set()
+        
+        for mask in tqdm(unique_masks, desc="Generating L4 (Substituents)"):
+            mask_list = list(mask)
+            
+            # выравнивание и выбор направления для корректной генерации L1/L2
+            aligned_mask = self._align_to_center(mask_list)
+            aligned_mask_rev = [aligned_mask[0]] + list(reversed(aligned_mask[1:]))
+
+            def get_base_smarts(seq):
+                pure_seq = [(atom, None) for atom, _ in seq]
+                return (self._build_smarts(pure_seq, level=1), 
+                        self._build_smarts(pure_seq, level=2))
+
+            l1_fwd, l2_fwd = get_base_smarts(aligned_mask)
+            l1_rev, l2_rev = get_base_smarts(aligned_mask_rev)
+
+            if l1_fwd < l1_rev:
+                l1_smarts, l2_smarts = l1_fwd, l2_fwd
+                target_seq = aligned_mask
+            else:
+                l1_smarts, l2_smarts = l1_rev, l2_rev
+                target_seq = aligned_mask_rev
+
+            l0_smarts = self._build_smarts(target_seq, level=0)
+            l3_smarts = self._build_smarts(target_seq, level=3)
+
+            star_pos = [i for i, (_, tag) in enumerate(target_seq) if tag == '*']
+            
+            for labels in product(self.substituents, repeat=len(star_pos)):
+                final_struct_resolved = []
+                iter_labels = iter(labels)
+                for atom, tag in target_seq:
+                    if tag == '*':
+                        final_struct_resolved.append((atom, next(iter_labels)))
+                    else:
+                        final_struct_resolved.append((atom, tag))
+                
+                final_hash = self._canonical_necklace(tuple(final_struct_resolved))
+                
+                if final_hash not in seen_final_structs:
+                    seen_final_structs.add(final_hash)
+                    
+                    final_data.append({
+                        "layer0_smarts": l0_smarts,
+                        "layer1_smarts": l1_smarts,
+                        "layer2_smarts": l2_smarts,
+                        "layer3_smarts": l3_smarts,
+                        "layer4_smarts": self._build_smarts(final_struct_resolved, level=4)
+                    })
+
+        # сборка таблицы
+        df = pd.DataFrame(final_data)
+        if not df.empty:
+            cols = sorted(list(df.columns))
+            return df[cols].sort_values(by=cols).reset_index(drop=True)
+        return df
+
 
 if __name__ == "__main__":
-    df = generate_hierarchical_library()
+    generator = HeterocycleGenerator(
+        ring_size=5,
+        min_subs=2, 
+        max_subs=3,
+        max_n_skeleton=2
+    )
+    
+    df = generator.generate_library()
     print(f"собрана таблица из {len(df)} уникальных подструктур.")
     
     print("первые 5 строк:")

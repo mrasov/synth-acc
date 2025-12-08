@@ -4,192 +4,164 @@ import pandas as pd
 from tqdm import tqdm
 
 
-L0_SMARTS = "[a:1]:1:a:a:a:a1"
-
 def build_hierarchical_tree(df_library):
     """
-    Строит дерево SMARTS-подструктур 
-    от базового паттерна [a:1]:1:a:a:a:a1 к дочерним на 1 уровне и далее
-    {l1: {l2: {l3: {l4: [l5, ...]}}}}
+    Строит оптимизированное дерево для обхода:
+    (smarts_str, rdkit_mol, children_list)
+    """
     
-    Сохраняет кеш SMARTS -> Mol
+    # сборка кешей SMARTS -> Mol
+    unique_smarts = set()
+    # теперь только до layer4
+    cols = ['layer0_smarts', 'layer1_smarts', 'layer2_smarts', 'layer3_smarts', 'layer4_smarts']
+    
+    if 'layer0_smarts' not in df_library.columns:
+        raise ValueError("В библиотеке отсутствует столбец layer0_smarts")
+    
+    l0_str = df_library['layer0_smarts'].iloc[0]
+    unique_smarts.add(l0_str)
+
+    for c in cols[1:]:
+        unique_smarts.update(df_library[c].dropna().unique())
+
+    mol_cache = {}
+    for s in tqdm(unique_smarts, desc="Pre-compiling SMARTS"):
+        if not s: continue
+        try:
+            mol_cache[s] = Chem.MolFromSmarts(s)
+        except Exception:
+            mol_cache[s] = None
+
+    # сборка структуры словарей (промежуточный шаг)
+    # структура: L1 -> L2 -> L3 -> set(L4)
+    tree_dict = {}
+    for row in df_library.itertuples(index=False):
+        d1 = tree_dict.setdefault(row.layer1_smarts, {})
+        d2 = d1.setdefault(row.layer2_smarts, {})
+        s3 = d2.setdefault(row.layer3_smarts, set())
+        s3.add(row.layer4_smarts) # L4 теперь лист
+
+    # преобразование в список узлов (txt, mol, children)
+    optimized_roots = []
+    
+    for l1_txt, l1_children in tree_dict.items():
+        l1_mol = mol_cache.get(l1_txt)
+        if l1_mol is None: continue
+        
+        l2_nodes = []
+        for l2_txt, l2_children in l1_children.items():
+            l2_mol = mol_cache.get(l2_txt)
+            if l2_mol is None: continue
+            
+            l3_nodes = []
+            for l3_txt, l4_set in l2_children.items():
+                l3_mol = mol_cache.get(l3_txt)
+                if l3_mol is None: continue
+                
+                l4_nodes = []
+                # L4 - последний уровень (листья)
+                for l4_txt in l4_set:
+                    l4_mol = mol_cache.get(l4_txt)
+                    if l4_mol:
+                        l4_nodes.append((l4_txt, l4_mol, None)) # детей нет
+                
+                l3_nodes.append((l3_txt, l3_mol, l4_nodes))
+            l2_nodes.append((l2_txt, l2_mol, l3_nodes))
+        optimized_roots.append((l1_txt, l1_mol, l2_nodes))
+
+    return mol_cache.get(l0_str), optimized_roots
+
+
+def collect_fragment_statistics(molecules_df, df_library, store_matches=False):
     """
-    # сборка дерева подструктур
-    tree = {}
-    for _, r in df_library.iterrows():
-        l1 = r['layer1_smarts']
-        l2 = r['layer2_smarts']
-        l3 = r['layer3_smarts']
-        l4 = r['layer4_smarts']
-        l5 = r['layer5_smarts']
-        tree.setdefault(l1, {}).setdefault(l2, {}).setdefault(l3, {}).setdefault(l4, []).append(l5)
-
-    # подготовка к сборке кешей SMARTS -> Mol
-    def unique_patterns(col):
-        return set(df_library[col].dropna().astype(str).unique())
-
-    set_l1 = unique_patterns('layer1_smarts')
-    set_l2 = unique_patterns('layer2_smarts')
-    set_l3 = unique_patterns('layer3_smarts')
-    set_l4 = unique_patterns('layer4_smarts')
-    set_l5 = unique_patterns('layer5_smarts')
-
-    caches = {'L0': None, 'l1': {}, 'l2': {}, 'l3': {}, 'l4': {}, 'l5': {}}
-    try:
-        caches['L0'] = Chem.MolFromSmarts(L0_SMARTS)
-    except Exception:
-        caches['L0'] = None
-
-    def compile_set(sset):
-        c = {}
-        for s in sset:
-            if s is None or (isinstance(s, str) and s.strip() == ""):
-                c[s] = None
-                continue
-            try:
-                m = Chem.MolFromSmarts(s)
-            except Exception:
-                m = None
-            c[s] = m
-        return c
-
-    caches['l1'] = compile_set(set_l1)
-    caches['l2'] = compile_set(set_l2)
-    caches['l3'] = compile_set(set_l3)
-    caches['l4'] = compile_set(set_l4)
-    caches['l5'] = compile_set(set_l5)
-
-    return tree, caches
-
-
-def collect_fragment_statistics(molecules_df, df_library):
+    Иерархический подсчет частот фрагментов (L0 -> L4).
     """
-    Подсчет статистик по уровням L0...L5.
-    """
-    tree, caches = build_hierarchical_tree(df_library)
+    
+    # подготовка дерева поиска
+    l0_pat, search_tree = build_hierarchical_tree(df_library)
+    if l0_pat is None:
+        raise ValueError("Ошибка компиляции L0 SMARTS")
+
     pattern_counts = {
-        'L1': defaultdict(int),
-        'L2': defaultdict(int),
-        'L3': defaultdict(int),
-        'L4': defaultdict(int),
-        'L5': defaultdict(int)
+        'L1': defaultdict(int), 'L2': defaultdict(int),
+        'L3': defaultdict(int), 'L4': defaultdict(int)
     }
     l0_count = 0
 
     matches = None
-    matches = {'L0': set(), 'L1': defaultdict(set), 'L2': defaultdict(set),
-                'L3': defaultdict(set), 'L4': defaultdict(set), 'L5': defaultdict(set)}
+    if store_matches:
+        matches = {
+            'L0': set(), 'L1': defaultdict(set), 'L2': defaultdict(set),
+            'L3': defaultdict(set), 'L4': defaultdict(set)
+        }
 
-    iterrows = tqdm(molecules_df.itertuples(index=False), total=len(molecules_df), desc="Scanning molecules set")
-
+    # основной цикл сканирования
+    iterrows = tqdm(molecules_df.itertuples(index=False), total=len(molecules_df), desc="Scanning molecules")
+    
     for row in iterrows:
-        mol_id = getattr(row, 'molecule_chembl_id')
-        smi = getattr(row, 'canonical_smiles')
-
         try:
+            mol_id = getattr(row, 'molecule_chembl_id')
+            smi = getattr(row, 'canonical_smiles')
+            if not isinstance(smi, str): continue
             mol = Chem.MolFromSmiles(smi)
         except Exception:
             continue
-        if mol is None:
+            
+        if mol is None: continue
+
+        # проверка L0 (общий фильтр)
+        if not mol.HasSubstructMatch(l0_pat):
             continue
-
-        # проверка вхождения базового паттерна
-        if caches['L0'] is not None and mol.HasSubstructMatch(caches['L0']):
-            l0_count += 1
-            matches['L0'].add(mol_id)
-        else:
-            continue
-
-        seen_L1 = set()
-        seen_L2 = set()
-        seen_L3 = set()
-        seen_L4 = set()
-        seen_L5 = set()
-
-        # первый уровень
-        for l1, d2 in tree.items():
-            pat1 = caches['l1'].get(l1)
-            if pat1 is None:
-                continue
-            if not mol.HasSubstructMatch(pat1):
-                continue
-            if l1 not in seen_L1:
-                pattern_counts['L1'][l1] += 1
-                seen_L1.add(l1)
-                matches['L1'][l1].add(mol_id)
         
-        # второй уровень
-            for l2, d3 in d2.items():
-                pat2 = caches['l2'].get(l2)
-                if pat2 is None:
+        l0_count += 1
+        if store_matches: matches['L0'].add(mol_id)
+        
+        # уровень L1
+        for l1_txt, l1_mol, l2_list in search_tree:
+            if not mol.HasSubstructMatch(l1_mol):
+                continue
+            
+            pattern_counts['L1'][l1_txt] += 1
+            if store_matches: matches['L1'][l1_txt].add(mol_id)
+            
+            # уровень L2
+            for l2_txt, l2_mol, l3_list in l2_list:
+                if not mol.HasSubstructMatch(l2_mol):
                     continue
-                if not mol.HasSubstructMatch(pat2):
-                    continue
-                if l2 not in seen_L2:
-                    pattern_counts['L2'][l2] += 1
-                    seen_L2.add(l2)
-                    matches['L2'][l2].add(mol_id)
-
-        # третий уровень
-                for l3, d4 in d3.items():
-                    pat3 = caches['l3'].get(l3)
-                    if pat3 is None:
+                
+                pattern_counts['L2'][l2_txt] += 1
+                if store_matches: matches['L2'][l2_txt].add(mol_id)
+                
+                # уровень L3
+                for l3_txt, l3_mol, l4_list in l3_list:
+                    if not mol.HasSubstructMatch(l3_mol):
                         continue
-                    if not mol.HasSubstructMatch(pat3):
-                        continue
-                    if l3 not in seen_L3:
-                        pattern_counts['L3'][l3] += 1
-                        seen_L3.add(l3)
-                        matches['L3'][l3].add(mol_id)
+                        
+                    pattern_counts['L3'][l3_txt] += 1
+                    if store_matches: matches['L3'][l3_txt].add(mol_id)
+                    
+                    # уровень L4 (лист)
+                    for l4_txt, l4_mol, _ in l4_list:
+                        if mol.HasSubstructMatch(l4_mol):
+                            pattern_counts['L4'][l4_txt] += 1
+                            if store_matches: matches['L4'][l4_txt].add(mol_id)
 
-        # четвертый уровень
-                    for l4, l5s in d4.items():
-                        pat4 = caches['l4'].get(l4)
-                        if pat4 is None:
-                            continue
-                        if not mol.HasSubstructMatch(pat4):
-                            continue
-                        if l4 not in seen_L4:
-                            pattern_counts['L4'][l4] += 1
-                            seen_L4.add(l4)
-                            matches['L4'][l4].add(mol_id)
-
-        # пятый уровень, листья дерева
-                        for l5 in l5s:
-                            pat5 = caches['l5'].get(l5)
-                            if pat5 is None:
-                                continue
-                            if l5 in seen_L5:
-                                continue
-                            if mol.HasSubstructMatch(pat5):
-                                pattern_counts['L5'][l5] += 1
-                                seen_L5.add(l5)
-                                matches['L5'][l5].add(mol_id)
-
-    # подготовка результатов по каждому уровню L1...L5
+    # приведение результатов к DF
     def dict_to_df(d):
-        df = pd.DataFrame([{'pattern': k, 'count': v} for k, v in d.items()])
-        if df.shape[0] == 0:
-            return df
-        return df.sort_values('count', ascending=False).reset_index(drop=True)
+        if not d: return pd.DataFrame(columns=['pattern', 'count'])
+        return pd.DataFrame(list(d.items()), columns=['pattern', 'count']).sort_values('count', ascending=False).reset_index(drop=True)
 
-    df_L1 = dict_to_df(pattern_counts['L1'])
-    df_L2 = dict_to_df(pattern_counts['L2'])
-    df_L3 = dict_to_df(pattern_counts['L3'])
-    df_L4 = dict_to_df(pattern_counts['L4'])
-    df_L5 = dict_to_df(pattern_counts['L5'])
+    result_dfs = {k: dict_to_df(v) for k, v in pattern_counts.items()}
+    
+    print(f"L0 Matches: {l0_count}")
+    for lvl in ['L1', 'L2', 'L3', 'L4']:
+        found = len(result_dfs[lvl])
+        total = df_library[f'layer{lvl[-1]}_smarts'].nunique()
+        print(f"{lvl}: found {found} / {total} patterns")
 
-    for lvl, df_lvl in [('L1', df_L1), ('L2', df_L2), ('L3', df_L3), ('L4', df_L4), ('L5', df_L5)]:
-        n_ge1 = (df_lvl['count'] >= 1).sum() if not df_lvl.empty else 0
-        n_ge10 = (df_lvl['count'] >= 10).sum() if not df_lvl.empty else 0
-        print(f"{lvl}: patterns seen >=1: {n_ge1}, >=10: {n_ge10}, total patterns in lib: {len(df_library[f'layer{lvl[-1]}_smarts'].unique()) if lvl!='L0' else 'NA'}")
-
-    print(f"L0: molecules containing L0 pattern: {l0_count}")
-
-    per_level_counts = {'L0': l0_count, 'L1': df_L1, 'L2': df_L2, 'L3': df_L3, 'L4': df_L4, 'L5': df_L5}
-    result = {
+    per_level_counts = {'L0': l0_count, **result_dfs}
+    
+    return {
         'per_level_counts': per_level_counts,
-        'pattern_counts': pattern_counts,
         'matches': matches
     }
-    return result
