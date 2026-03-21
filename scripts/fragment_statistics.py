@@ -1,7 +1,10 @@
 from collections import defaultdict
 from rdkit import Chem
 import pandas as pd
-from tqdm import tqdm
+from tqdm.auto import tqdm
+from joblib import Parallel, delayed
+import multiprocessing as mp
+import math
 
 
 def build_hierarchical_tree(df_library):
@@ -82,6 +85,58 @@ def build_hierarchical_tree(df_library):
     return mol_cache.get(l0_str), optimized_roots
 
 
+def _worker_process_chunk(chunk_dicts, l0_pat, search_tree, store_matches):
+    local_l0_count = 0
+    local_pattern_counts = {
+        "L1": defaultdict(int), "L2": defaultdict(int),
+        "L3": defaultdict(int), "L4": defaultdict(int),
+    }
+
+    local_matches = None
+    if store_matches:
+        local_matches = {
+            "L0": set(), "L1": defaultdict(set),
+            "L2": defaultdict(set), "L3": defaultdict(set), "L4": defaultdict(set),
+        }
+
+    for row in chunk_dicts:
+        try:
+            mol_id = row.get("molecule_chembl_id")
+            smi = row.get("canonical_smiles")
+            if not isinstance(smi, str): continue
+            mol = Chem.MolFromSmiles(smi)
+            mol = Chem.AddHs(mol)
+        except Exception: continue
+
+        if mol is None: continue
+        if not mol.HasSubstructMatch(l0_pat): continue
+
+        local_l0_count += 1
+        if store_matches: local_matches["L0"].add(mol_id)
+
+        for l1_txt, l1_mol, l2_list in search_tree:
+            if not mol.HasSubstructMatch(l1_mol): continue
+            local_pattern_counts["L1"][l1_txt] += 1
+            if store_matches: local_matches["L1"][l1_txt].add(mol_id)
+
+            for l2_txt, l2_mol, l3_list in l2_list:
+                if not mol.HasSubstructMatch(l2_mol): continue
+                local_pattern_counts["L2"][l2_txt] += 1
+                if store_matches: local_matches["L2"][l2_txt].add(mol_id)
+
+                for l3_txt, l3_mol, l4_list in l3_list:
+                    if not mol.HasSubstructMatch(l3_mol): continue
+                    local_pattern_counts["L3"][l3_txt] += 1
+                    if store_matches: local_matches["L3"][l3_txt].add(mol_id)
+
+                    for l4_txt, l4_mol, _ in l4_list:
+                        if mol.HasSubstructMatch(l4_mol):
+                            local_pattern_counts["L4"][l4_txt] += 1
+                            if store_matches: local_matches["L4"][l4_txt].add(mol_id)
+
+    return local_l0_count, local_pattern_counts, local_matches, len(chunk_dicts)
+
+
 def collect_fragment_statistics(molecules_df, df_library, store_matches=False):
     """
     Иерархический подсчет частот фрагментов (L0 -> L4).
@@ -111,69 +166,39 @@ def collect_fragment_statistics(molecules_df, df_library, store_matches=False):
         }
 
     # основной цикл сканирования
-    iterrows = tqdm(
-        molecules_df.itertuples(index=False),
-        total=len(molecules_df),
-        desc="Scanning molecules",
-    )
+    if num_workers is None:
+        num_workers = mp.cpu_count()
+    
+    num_chunks = min(len(molecules_df), num_workers * 4)
+    chunk_data = []
+    if num_chunks > 0:
+        chunk_size = math.ceil(len(molecules_df) / num_chunks)
+        cols_to_keep = [c for c in ["molecule_chembl_id", "canonical_smiles"] if c in molecules_df.columns]
+        
+        for i in range(0, len(molecules_df), chunk_size):
+            chunk = molecules_df[cols_to_keep].iloc[i : i + chunk_size]
+            chunk_data.append(chunk.to_dict('records'))
 
-    for row in iterrows:
-        try:
-            mol_id = getattr(row, "molecule_chembl_id")
-            smi = getattr(row, "canonical_smiles")
-            if not isinstance(smi, str):
-                continue
-            mol = Chem.MolFromSmiles(smi)
-            mol = Chem.AddHs(mol)
-        except Exception:
-            continue
-
-        if mol is None:
-            continue
-
-        # проверка L0 (общий фильтр)
-        if not mol.HasSubstructMatch(l0_pat):
-            continue
-
-        l0_count += 1
-        if store_matches:
-            matches["L0"].add(mol_id)
-
-        # уровень L1
-        for l1_txt, l1_mol, l2_list in search_tree:
-            if not mol.HasSubstructMatch(l1_mol):
-                continue
-
-            pattern_counts["L1"][l1_txt] += 1
+    if chunk_data:
+        results = Parallel(n_jobs=num_workers)(
+            delayed(_worker_process_chunk)(
+                chunk, l0_pat, search_tree, store_matches
+            ) for chunk in tqdm(chunk_data, desc=f"Sending chunks to {num_workers} processes")
+        )
+        
+        for loc_l0, loc_pat, loc_mat, _ in results:
+            l0_count += loc_l0
+            for lvl in ["L1", "L2", "L3", "L4"]:
+                for pat, count in loc_pat[lvl].items():
+                    pattern_counts[lvl][pat] += count
+                    
             if store_matches:
-                matches["L1"][l1_txt].add(mol_id)
+                matches["L0"].update(loc_mat["L0"])
+                for lvl in ["L1", "L2", "L3", "L4"]:
+                    for pat, ids in loc_mat[lvl].items():
+                        matches[lvl][pat].update(ids)
 
-            # уровень L2
-            for l2_txt, l2_mol, l3_list in l2_list:
-                if not mol.HasSubstructMatch(l2_mol):
-                    continue
 
-                pattern_counts["L2"][l2_txt] += 1
-                if store_matches:
-                    matches["L2"][l2_txt].add(mol_id)
-
-                # уровень L3
-                for l3_txt, l3_mol, l4_list in l3_list:
-                    if not mol.HasSubstructMatch(l3_mol):
-                        continue
-
-                    pattern_counts["L3"][l3_txt] += 1
-                    if store_matches:
-                        matches["L3"][l3_txt].add(mol_id)
-
-                    # уровень L4 (лист)
-                    for l4_txt, l4_mol, _ in l4_list:
-                        if mol.HasSubstructMatch(l4_mol):
-                            pattern_counts["L4"][l4_txt] += 1
-                            if store_matches:
-                                matches["L4"][l4_txt].add(mol_id)
-
-    # приведение результатов к DF
     def dict_to_df(d):
         if not d:
             return pd.DataFrame(columns=["pattern", "count"])
