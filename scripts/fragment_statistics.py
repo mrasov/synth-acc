@@ -124,6 +124,7 @@ def collect_fragment_statistics(molecules_df, df_library, store_matches=False):
             if not isinstance(smi, str):
                 continue
             mol = Chem.MolFromSmiles(smi)
+            mol = Chem.AddHs(mol)
         except Exception:
             continue
 
